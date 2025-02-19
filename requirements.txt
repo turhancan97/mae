@@ -8,3 +8,4 @@ tensorboard
 einops
 tqdm
 wandb
+decord

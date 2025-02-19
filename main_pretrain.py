@@ -18,7 +18,7 @@ from pathlib import Path
 
 import torch
 import torch.backends.cudnn as cudnn
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
@@ -29,22 +29,28 @@ import timm.optim.optim_factory as optim_factory
 
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
+from util.logger import WandbLogger
+
 
 import models_mae
 
 from engine_pretrain import train_one_epoch
 
+from WTDataloader import WTDatasetOneVideo
+
+# # trade-off between speed and accuracy.
+# torch.set_float32_matmul_precision("medium")
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
-    parser.add_argument('--batch_size', default=64, type=int,
+    parser.add_argument('--batch_size', default=16, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=400, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
     # Model parameters
-    parser.add_argument('--model', default='mae_vit_large_patch16', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='mae_vit_base_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
 
     parser.add_argument('--input_size', default=224, type=int,
@@ -72,7 +78,7 @@ def get_args_parser():
                         help='epochs to warmup LR')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/datasets01/imagenet_full_size/061417/', type=str,
+    parser.add_argument('--data_path', default='/shared/sets/datasets/vision/videos/walking_tour/Venice20sec.mp4', type=str,
                         help='dataset path')
 
     parser.add_argument('--output_dir', default='./output_dir',
@@ -84,10 +90,18 @@ def get_args_parser():
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--resume', default='',
                         help='resume from checkpoint')
+    parser.add_argument('--log_wandb', default=False, action='store_true',
+                        help='Log training and validation metrics to wandb')
+    parser.add_argument('--wandb_project', default='MAE-Video', type=str,
+                        help='Project name on wandb')
+    parser.add_argument('--wandb_entity', default=None, type=str,
+                        help='User or team name on wandb')
+    parser.add_argument('--wandb_run_name', default='Pre-train', type=str,
+                        help='Run name on wandb')
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
-    parser.add_argument('--num_workers', default=10, type=int)
+    parser.add_argument('--num_workers', default=16, type=int)
     parser.add_argument('--pin_mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
@@ -98,6 +112,7 @@ def get_args_parser():
                         help='number of distributed processes')
     parser.add_argument('--local_rank', default=-1, type=int)
     parser.add_argument('--dist_on_itp', action='store_true')
+    # parser.set_defaults(dist_on_itp=False)
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
 
@@ -121,12 +136,16 @@ def main(args):
 
     # simple augmentation
     transform_train = transforms.Compose([
+            transforms.ToPILImage(),
             transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    print(dataset_train)
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
+    # dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+    dataset_train = WTDatasetOneVideo(args.data_path, 1, transform=transform_train)
+    print(f"Dataset train length: {len(dataset_train)}")
+    print(f"Video length: {dataset_train.get_video_length()}")
+    print(f"Frame shape: {dataset_train[0][0].shape}")
 
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
@@ -138,9 +157,9 @@ def main(args):
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
 
-    if global_rank == 0 and args.log_dir is not None:
+    if global_rank == 0 and args.log_wandb and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.log_dir)
+        log_writer = WandbLogger(args)
     else:
         log_writer = None
 
@@ -161,7 +180,7 @@ def main(args):
     print("Model = %s" % str(model_without_ddp))
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
-    
+    num_training_steps_per_epoch = len(dataset_train) // eff_batch_size
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 256
 
@@ -188,6 +207,9 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
+        if log_writer is not None:
+            log_writer.set_step(epoch * num_training_steps_per_epoch * args.accum_iter)
+
         train_stats = train_one_epoch(
             model, data_loader_train,
             optimizer, device, epoch, loss_scaler,
@@ -201,6 +223,9 @@ def main(args):
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         'epoch': epoch,}
+        
+        if log_writer is not None:
+            log_writer.update(log_stats)
 
         if args.output_dir and misc.is_main_process():
             if log_writer is not None:

@@ -1,0 +1,10 @@
+# python 3.8
+torch==1.8.1
+torchvision==0.9.1
+torchaudio==0.8.1
+timm==0.3.2
+numpy==1.20
+tensorboard
+einops
+tqdm
+wandb

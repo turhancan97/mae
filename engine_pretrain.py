@@ -16,7 +16,7 @@ import torch
 
 import util.misc as misc
 import util.lr_sched as lr_sched
-
+from einops import rearrange
 
 def train_one_epoch(model: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -33,8 +33,8 @@ def train_one_epoch(model: torch.nn.Module,
 
     optimizer.zero_grad()
 
-    if log_writer is not None:
-        print('log_dir: {}'.format(log_writer.log_dir))
+    # if log_writer is not None:
+    #     print('log_dir: {}'.format(log_writer.log_dir))
 
     for data_iter_step, (samples, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
@@ -45,7 +45,7 @@ def train_one_epoch(model: torch.nn.Module,
         samples = samples.to(device, non_blocking=True)
 
         with torch.cuda.amp.autocast():
-            loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
+            loss, pred, mask = model(samples, mask_ratio=args.mask_ratio)
 
         loss_value = loss.item()
 
@@ -67,14 +67,43 @@ def train_one_epoch(model: torch.nn.Module,
         metric_logger.update(lr=lr)
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)
-        if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
-            """ We use epoch_1000x as the x-axis in tensorboard.
-            This calibrates different curves when batch size changes.
-            """
-            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
-            log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
-            log_writer.add_scalar('lr', lr, epoch_1000x)
+        # if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
+        #     """ We use epoch_1000x as the x-axis in tensorboard.
+        #     This calibrates different curves when batch size changes.
+        #     """
+        #     epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
+        #     log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
+        #     log_writer.add_scalar('lr', lr, epoch_1000x)
+        
+        if log_writer is not None:
+            log_writer.update(
+                {
+                    'loss': loss_value_reduce,
+                    'lr': lr,
+                }
+            )
+            log_writer.set_step()
 
+    # log the last batch
+    if log_writer is not None:
+        # log_writer.log_image(samples, 'samples')
+        samples = samples[0:8]
+        samples = samples.detach().cpu()
+
+        pred = model.unpatchify(pred[0:8])
+        pred = pred.detach().cpu()
+        mask = mask[0:8].detach()
+
+        mask = mask.unsqueeze(-1).repeat(1, 1, model.patch_embed.patch_size[0]**2 *3)  # (N, H*W, p*p*3)
+        mask = model.unpatchify(mask)  # 1 is removing, 0 is keeping
+        mask = mask.detach().cpu()
+
+        im_masked = samples * (1 - mask)
+        im_paste = samples * (1 - mask) + pred * mask
+
+        log_writer.log_image(im_masked, f"masked")
+        log_writer.log_image(im_paste, f"reconstructed")
+        log_writer.log_image(samples, f"original")
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

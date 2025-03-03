@@ -1,11 +1,12 @@
 # python 3.8
-torch==1.8.1
-torchvision==0.9.1
-torchaudio==0.8.1
-timm==0.3.2
+torch==1.12.1+cu113
+torchvision==0.13.1+cu113
+torchaudio==0.12.1+cu113
+timm==0.4.12
 numpy==1.20
 tensorboard
 einops
 tqdm
 wandb
 decord
+mmengine-lite

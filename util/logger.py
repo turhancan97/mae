@@ -4,6 +4,7 @@ import torch
 class WandbLogger(object):
     def __init__(self, args):
         wandb.init(
+            dir=args.log_dir,
             config=args,
             entity=args.wandb_entity,
             project=args.wandb_project,

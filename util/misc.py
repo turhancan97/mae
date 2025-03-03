@@ -312,15 +312,134 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
         model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
 
 
-def load_model(args, model_without_ddp, optimizer, loss_scaler):
+def convert_qkv_weights(state_dict):
+    """Convert separate Q, K, V weights into combined QKV weights.
+    
+    Args:
+        state_dict (dict): State dict from pretrained model
+        
+    Returns:
+        dict: Converted state dict with combined QKV weights
+    """
+    new_state_dict = {}
+    
+    # Copy non-QKV weights directly
+    for k, v in state_dict.items():
+        if not any(x in k for x in ['.q.', '.k.', '.v.']):
+            new_state_dict[k] = v
+            
+    # Combine Q, K, V weights and biases for each block
+    for block_idx in range(12):  # Assuming 12 blocks
+        prefix = f'blocks.{block_idx}.attn.'
+        
+        # Get Q, K, V weights
+        q_weight = state_dict[prefix + 'q.weight']
+        k_weight = state_dict[prefix + 'k.weight']
+        v_weight = state_dict[prefix + 'v.weight']
+        
+        # Get Q, K, V biases
+        q_bias = state_dict[prefix + 'q.bias']
+        k_bias = state_dict[prefix + 'k.bias']
+        v_bias = state_dict[prefix + 'v.bias']
+        
+        # Concatenate weights and biases
+        qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+        qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+        
+        # Store combined weights
+        new_state_dict[prefix + 'qkv.weight'] = qkv_weight
+        new_state_dict[prefix + 'qkv.bias'] = qkv_bias
+    
+    return new_state_dict
+
+
+def convert_mmcv_state_dict(state_dict):
+    """Convert MMCV model state dict keys to match the target model structure.
+    
+    Args:
+        state_dict (dict): State dict from MMCV model
+        
+    Returns:
+        dict: Converted state dict with matching keys
+    """
+    new_state_dict = {}
+    
+    # Define keys to skip
+    skip_keys = [
+        'backbone.mask_token',
+        'target_generator.weight_x',
+        'target_generator.weight_y', 
+        'target_generator.gaussian_kernel',
+        'neck.fc.weight',
+        'neck.fc.bias'
+    ]
+    
+    key_mapping = {
+        'backbone.cls_token': 'cls_token',
+        'backbone.pos_embed': 'pos_embed',
+        'backbone.patch_embed.projection': 'patch_embed.proj',
+        'backbone.ln1': 'norm',
+    }
+    
+    # Handle transformer blocks mapping
+    block_mapping = {
+        'backbone.layers': 'blocks',
+        'ln1': 'norm1',
+        'ln2': 'norm2',
+        'ffn.layers.0.0': 'mlp.fc1',
+        'ffn.layers.1': 'mlp.fc2'
+    }
+    
+    for old_key, param in state_dict.items():
+        # Skip unwanted keys
+        if any(skip_key in old_key for skip_key in skip_keys):
+            continue
+            
+        new_key = old_key
+        
+        # Apply direct key mappings
+        for old_pattern, new_pattern in key_mapping.items():
+            if old_key.startswith(old_pattern):
+                new_key = old_key.replace(old_pattern, new_pattern)
+                break
+                
+        # Handle transformer blocks
+        if 'backbone.layers' in old_key:
+            new_key = old_key
+            for old_pattern, new_pattern in block_mapping.items():
+                new_key = new_key.replace(old_pattern, new_pattern)
+            new_key = new_key.replace('backbone.', '')
+            
+        new_state_dict[new_key] = param
+        
+    return new_state_dict
+
+
+def load_model(args, model_without_ddp, optimizer, loss_scaler, mmcv=True):
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
+            
+        if mmcv:
+            # Convert MMCV state dict keys
+            model_state = convert_mmcv_state_dict(checkpoint['state_dict'])
+        else:
+            # Convert QKV weights if needed
+            if 'blocks.0.attn.q.weight' in checkpoint['model_state']:
+                checkpoint['model_state'] = convert_qkv_weights(checkpoint['model_state'])
+                
+            # Filter out hog-related keys and mask_token
+            model_state = {k: v for k, v in checkpoint['model_state'].items() 
+                        if 'hog' not in k.lower() and 'mask_token' not in k}
+            
+        msg = model_without_ddp.load_state_dict(model_state, strict=False)
         print("Resume checkpoint %s" % args.resume)
+        print("Missing keys:", msg.missing_keys)
+        print("Unexpected keys:", msg.unexpected_keys)
+
         if 'optimizer' in checkpoint and 'epoch' in checkpoint and not (hasattr(args, 'eval') and args.eval):
             optimizer.load_state_dict(checkpoint['optimizer'])
             args.start_epoch = checkpoint['epoch'] + 1

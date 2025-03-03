@@ -23,8 +23,9 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
 import timm
+import sys
 
-assert timm.__version__ == "0.3.2"  # version check
+# assert timm.__version__ == "0.3.2"  # version check
 import timm.optim.optim_factory as optim_factory
 
 import util.misc as misc
@@ -35,17 +36,15 @@ from util.logger import WandbLogger
 import models_mae
 
 from engine_pretrain import train_one_epoch
-
-from WTDataloader import WTDatasetOneVideo
-
+from frame_dataloader import FrameDataset
 # # trade-off between speed and accuracy.
 # torch.set_float32_matmul_precision("medium")
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
-    parser.add_argument('--batch_size', default=16, type=int,
+    parser.add_argument('--batch_size', default=128, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=400, type=int)
+    parser.add_argument('--epochs', default=60, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
@@ -63,22 +62,26 @@ def get_args_parser():
                         help='Use (per-patch) normalized pixels as targets for computing loss')
     parser.set_defaults(norm_pix_loss=False)
 
+    parser.add_argument('--use_flow_proj', action='store_true',
+                        help='Use flow projection')
+    parser.set_defaults(use_flow_proj=True)
+
     # Optimizer parameters
     parser.add_argument('--weight_decay', type=float, default=0.05,
                         help='weight decay (default: 0.05)')
 
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='learning rate (absolute lr)')
-    parser.add_argument('--blr', type=float, default=1e-3, metavar='LR',
+    parser.add_argument('--blr', type=float, default=1e-5, metavar='LR',
                         help='base learning rate: absolute_lr = base_lr * total_batch_size / 256')
     parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0')
 
-    parser.add_argument('--warmup_epochs', type=int, default=40, metavar='N',
+    parser.add_argument('--warmup_epochs', type=int, default=10, metavar='N',
                         help='epochs to warmup LR')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/shared/sets/datasets/vision/videos/walking_tour/Venice20sec.mp4', type=str,
+    parser.add_argument('--data_path', default='/shared/sets/datasets/vision/videos/walking_tour/Frames/Venice/step_60', type=str,
                         help='dataset path')
 
     parser.add_argument('--output_dir', default='./output_dir',
@@ -88,15 +91,19 @@ def get_args_parser():
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--resume', default='',
+    parser.add_argument('--resume', default='/home/kargin/Projects/repositories/mae/model/maskfeat_vit-base-p16_8xb256-amp-coslr-300e_in1k_20221101-6dfc8bf3.pth',
                         help='resume from checkpoint')
-    parser.add_argument('--log_wandb', default=False, action='store_true',
+    # parser.add_argument('--resume', default='/home/kargin/Projects/repositories/mae/model/in1k_VIT_B_MaskFeat_PT_epoch_01600.pyth',
+    #                     help='resume from checkpoint')
+
+    # Wandb
+    parser.add_argument('--log_wandb', default=True, action='store_true',
                         help='Log training and validation metrics to wandb')
     parser.add_argument('--wandb_project', default='MAE-Video', type=str,
                         help='Project name on wandb')
     parser.add_argument('--wandb_entity', default=None, type=str,
                         help='User or team name on wandb')
-    parser.add_argument('--wandb_run_name', default='Pre-train', type=str,
+    parser.add_argument('--wandb_run_name', default='OF_MAE_Venice_PT', type=str,
                         help='Run name on wandb')
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -135,17 +142,18 @@ def main(args):
     cudnn.benchmark = True
 
     # simple augmentation
-    transform_train = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
-            transforms.RandomHorizontalFlip(),
+    transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
     # dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    dataset_train = WTDatasetOneVideo(args.data_path, 1, transform=transform_train)
+    frame_step = args.data_path.split('/')[-1]
+    step = int(frame_step.split('step_')[1])
+    dataset_train = FrameDataset(args.data_path, 'train', transform, step)
+    # dataset_val = FrameDataset(args.data_path, 'val', transform, step)
+    # dataset_test = FrameDataset(args.data_path, 'test', transform, step)
     print(f"Dataset train length: {len(dataset_train)}")
-    print(f"Video length: {dataset_train.get_video_length()}")
     print(f"Frame shape: {dataset_train[0][0].shape}")
+    print(f"Flow shape: {dataset_train[0][1].shape}")
 
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
@@ -159,6 +167,16 @@ def main(args):
 
     if global_rank == 0 and args.log_wandb and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
+        if args.use_flow_proj:
+            proj_name = "w_flow_projection"
+        else:
+            proj_name = "wo_flow_projection"
+        if args.resume:
+            train_type = "FT"
+        else:
+            train_type = "PT"
+        args.wandb_run_name = f"{args.wandb_run_name}_Frame_{frame_step}_{proj_name}_{train_type}"
+        print(f"Wandb run name: {args.wandb_run_name}")
         log_writer = WandbLogger(args)
     else:
         log_writer = None
@@ -172,12 +190,12 @@ def main(args):
     )
     
     # define the model
-    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
+    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss, use_flow_proj=args.use_flow_proj)
 
     model.to(device)
 
     model_without_ddp = model
-    print("Model = %s" % str(model_without_ddp))
+    # print("Model = %s" % str(model_without_ddp))
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
     num_training_steps_per_epoch = len(dataset_train) // eff_batch_size
@@ -204,11 +222,13 @@ def main(args):
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
+
+    if log_writer is not None and misc.is_main_process():
+        log_writer.set_step(args.start_epoch)
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
-        if log_writer is not None:
-            log_writer.set_step(epoch * num_training_steps_per_epoch * args.accum_iter)
 
         train_stats = train_one_epoch(
             model, data_loader_train,
@@ -216,7 +236,7 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
-        if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
+        if args.output_dir and (epoch % 200 == 0 or epoch + 1 == args.epochs):
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
@@ -224,7 +244,7 @@ def main(args):
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         'epoch': epoch,}
         
-        if log_writer is not None:
+        if log_writer is not None and misc.is_main_process():
             log_writer.update(log_stats)
 
         if args.output_dir and misc.is_main_process():
@@ -232,6 +252,8 @@ def main(args):
                 log_writer.flush()
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
+        
+        # sys.exit()
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

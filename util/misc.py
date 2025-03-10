@@ -457,3 +457,197 @@ def all_reduce_mean(x):
         return x_reduce.item()
     else:
         return x
+
+
+def analyze_flow_quality(flow_dir, num_samples=100, output_dir=None, plot=False):
+    """
+    Analyze the quality of optical flow samples to determine appropriate filtering thresholds
+    
+    Args:
+        flow_dir (str): Directory containing optical flow files
+        num_samples (int): Number of samples to analyze
+        plot (bool): Whether to create visualization plots
+    
+    Returns:
+        dict: Dictionary with flow statistics
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import os
+    from tqdm import tqdm
+    
+    if not os.path.exists(flow_dir):
+        print(f"Flow directory {flow_dir} does not exist")
+        return {}
+    
+    flow_files = sorted([f for f in os.listdir(flow_dir) if f.endswith('.npy')])
+    if len(flow_files) == 0:
+        print(f"No flow files found in {flow_dir}")
+        return {}
+    
+    # Select a subset of samples if requested
+    if num_samples < len(flow_files):
+        import random
+        flow_files = random.sample(flow_files, num_samples)
+    
+    # Collect statistics
+    magnitudes = []
+    variances = []
+    flow_coverage = []
+    
+    for file in tqdm(flow_files, desc="Analyzing flow quality"):
+        try:
+            flow = np.load(os.path.join(flow_dir, file))
+            
+            # Calculate flow magnitude
+            flow_magnitude = np.sqrt(flow[0]**2 + flow[1]**2)
+            avg_magnitude = np.mean(flow_magnitude)
+            magnitudes.append(avg_magnitude)
+            
+            # Calculate flow variance
+            flow_variance = np.var(flow)
+            variances.append(flow_variance)
+            
+            # Calculate percentage of pixels with significant flow
+            significant_flow = (flow_magnitude > 1.0).sum() / flow_magnitude.size
+            flow_coverage.append(significant_flow)
+            
+        except Exception as e:
+            print(f"Error processing {file}: {e}")
+    
+    if plot:
+        plt.figure(figsize=(15, 5))
+        
+        plt.subplot(1, 3, 1)
+        plt.hist(magnitudes, bins=30)
+        plt.axvline(np.median(magnitudes), color='r', linestyle='--')
+        plt.title(f'Flow Magnitude Distribution\nMedian: {np.median(magnitudes):.2f}')
+        plt.xlabel('Average Magnitude')
+        plt.ylabel('Frequency')
+        
+        plt.subplot(1, 3, 2)
+        plt.hist(variances, bins=30)
+        plt.axvline(np.median(variances), color='r', linestyle='--')
+        plt.title(f'Flow Variance Distribution\nMedian: {np.median(variances):.2f}')
+        plt.xlabel('Flow Variance')
+        plt.ylabel('Frequency')
+        
+        plt.subplot(1, 3, 3)
+        plt.hist(flow_coverage, bins=30)
+        plt.axvline(np.median(flow_coverage), color='r', linestyle='--')
+        plt.title(f'Flow Coverage Distribution\nMedian: {np.median(flow_coverage):.2f}')
+        plt.xlabel('Percentage of Significant Flow')
+        plt.ylabel('Frequency')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'flow_quality_analysis.png'))
+        plt.close()
+    
+    stats = {
+        'mag_mean': np.mean(magnitudes),
+        'mag_median': np.median(magnitudes),
+        'mag_std': np.std(magnitudes),
+        'var_mean': np.mean(variances),
+        'var_median': np.median(variances),
+        'var_std': np.std(variances),
+        'coverage_mean': np.mean(flow_coverage),
+        'coverage_median': np.median(flow_coverage),
+        'coverage_std': np.std(flow_coverage),
+    }
+    
+    # Suggest thresholds
+    stats['suggested_mag_threshold'] = max(np.mean(magnitudes) - 0.5 * np.std(magnitudes), 0.5)
+    stats['suggested_var_threshold'] = max(np.mean(variances) - 0.5 * np.std(variances), 0.5)
+    
+    return stats
+
+
+def visualize_flow_samples(image_dir, flow_dir, output_dir='flow_samples', num_samples=10):
+    """
+    Visualize image and corresponding optical flow samples to help assess quality
+    
+    Args:
+        image_dir (str): Directory containing image files
+        flow_dir (str): Directory containing optical flow files
+        output_dir (str): Directory to save visualizations
+        num_samples (int): Number of samples to visualize
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import os
+    from PIL import Image
+    from torchvision.utils import flow_to_image
+    import torch
+    
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # Get all flow files
+    flow_files = sorted([f for f in os.listdir(flow_dir) if f.endswith('.npy')])
+    
+    if len(flow_files) == 0:
+        print(f"No flow files found in {flow_dir}")
+        return
+    
+    # Select a subset of samples
+    if num_samples < len(flow_files):
+        import random
+        selected_samples = random.sample(range(len(flow_files)), num_samples)
+        flow_files = [flow_files[i] for i in selected_samples]
+    
+    for flow_file in flow_files:
+        try:
+            # Extract frame number from flow filename
+            frame_num = int(flow_file.split('_')[2].split('.')[0])
+            
+            # Find corresponding image file
+            image_file = f'Venice_frame_{frame_num:06d}_1.jpg'
+            image_path = os.path.join(image_dir, image_file)
+            
+            if not os.path.exists(image_path):
+                print(f"Image file {image_path} not found")
+                continue
+            
+            # Load image and flow
+            image = np.array(Image.open(image_path))
+            flow = np.load(os.path.join(flow_dir, flow_file))
+            
+            # Convert flow to tensor and then to image
+            flow_tensor = torch.from_numpy(flow)
+            flow_img = flow_to_image(flow_tensor)
+            flow_img = flow_img.permute(1, 2, 0).numpy()
+            
+            # Calculate flow statistics
+            flow_magnitude = np.sqrt(flow[0]**2 + flow[1]**2)
+            avg_magnitude = np.mean(flow_magnitude)
+            flow_variance = np.var(flow)
+            significant_flow = (flow_magnitude > 1.0).sum() / flow_magnitude.size
+            
+            # Create visualization
+            plt.figure(figsize=(15, 5))
+            
+            plt.subplot(1, 3, 1)
+            plt.imshow(image)
+            plt.title('Original Image')
+            plt.axis('off')
+            
+            plt.subplot(1, 3, 2)
+            plt.imshow(flow_img)
+            plt.title('Optical Flow')
+            plt.axis('off')
+            
+            plt.subplot(1, 3, 3)
+            plt.imshow(flow_magnitude, cmap='hot')
+            plt.colorbar()
+            plt.title(f'Flow Magnitude\nAvg: {avg_magnitude:.2f}, Var: {flow_variance:.2f}')
+            plt.axis('off')
+            
+            plt.suptitle(f"Frame {frame_num} - Significant Flow Coverage: {significant_flow*100:.1f}%")
+            plt.tight_layout()
+            
+            # Save visualization
+            plt.savefig(os.path.join(output_dir, f'flow_sample_{frame_num:06d}.png'))
+            plt.close()
+            
+        except Exception as e:
+            print(f"Error processing {flow_file}: {e}")

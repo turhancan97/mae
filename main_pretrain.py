@@ -44,7 +44,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
     parser.add_argument('--batch_size', default=128, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=60, type=int)
+    parser.add_argument('--epochs', default=25, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
@@ -77,13 +77,14 @@ def get_args_parser():
     parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0')
 
-    parser.add_argument('--warmup_epochs', type=int, default=10, metavar='N',
+    parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N',
                         help='epochs to warmup LR')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/shared/sets/datasets/vision/videos/walking_tour/Frames/Venice/step_60', type=str,
+    parser.add_argument('--data_path', default='/shared/sets/datasets/vision/videos/walking_tour/Frames/Venice/step_30', type=str,
                         help='dataset path')
-
+    parser.add_argument('--partial', default=True, type=bool,
+                        help='use partial dataset')
     parser.add_argument('--output_dir', default='./output_dir',
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default='./output_dir',
@@ -149,6 +150,9 @@ def main(args):
     frame_step = args.data_path.split('/')[-1]
     step = int(frame_step.split('step_')[1])
     dataset_train = FrameDataset(args.data_path, 'train', transform, step)
+    if args.partial:
+        # only take 25 percent of the dataset
+        dataset_train = torch.utils.data.Subset(dataset_train, range(0, len(dataset_train), 4))
     # dataset_val = FrameDataset(args.data_path, 'val', transform, step)
     # dataset_test = FrameDataset(args.data_path, 'test', transform, step)
     print(f"Dataset train length: {len(dataset_train)}")
@@ -175,7 +179,11 @@ def main(args):
             train_type = "FT"
         else:
             train_type = "PT"
-        args.wandb_run_name = f"{args.wandb_run_name}_Frame_{frame_step}_{proj_name}_{train_type}"
+        if args.partial:
+            dataset_type = "25percent"
+        else:
+            dataset_type = "full"
+        args.wandb_run_name = f"{args.wandb_run_name}_Frame_{frame_step}_{proj_name}_{train_type}_{dataset_type}"
         print(f"Wandb run name: {args.wandb_run_name}")
         log_writer = WandbLogger(args)
     else:
@@ -189,7 +197,7 @@ def main(args):
         drop_last=True,
     )
     
-    # define the model
+    print("Using Self-Attention Decoder MAE model")
     model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss, use_flow_proj=args.use_flow_proj)
 
     model.to(device)

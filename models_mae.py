@@ -41,6 +41,7 @@ class MaskedAutoencoderViT(nn.Module):
         # Add flow projection layer with use_flow_proj flag
         self.use_flow_proj = use_flow_proj
         if self.use_flow_proj:
+            # Flow -> tokens projection
             self.flow_proj = nn.Linear(patch_size**2 * self.flow_in_chans, embed_dim)
 
         self.blocks = nn.ModuleList([

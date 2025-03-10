@@ -33,7 +33,7 @@ from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from util.logger import WandbLogger
 
 
-import models_mae
+import models_mae  # Import our new cross-attention MAE model
 
 from engine_pretrain import train_one_epoch
 from frame_dataloader import FrameDataset
@@ -197,7 +197,7 @@ def main(args):
         drop_last=True,
     )
     
-    print("Using Self-Attention Decoder MAE model")
+    print("Using Cross-Attention Decoder MAE model")
     model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss, use_flow_proj=args.use_flow_proj)
 
     model.to(device)

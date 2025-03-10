@@ -15,12 +15,110 @@ import torch
 import torch.nn as nn
 
 from timm.models.vision_transformer import PatchEmbed, Block
+from timm.models.vision_transformer import DropPath
 
 from util.pos_embed import get_2d_sincos_pos_embed
 
 
+# Custom Cross-Attention layer
+class CrossAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        # Separate projections for queries, keys, and values
+        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, queries, keys, values):
+        B, N_q, C = queries.shape
+        _, N_k, _ = keys.shape
+        _, N_v, _ = values.shape
+        
+        # Project queries, keys, and values
+        q = self.q_proj(queries).reshape(B, N_q, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        k = self.k_proj(keys).reshape(B, N_k, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        v = self.v_proj(values).reshape(B, N_v, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        
+        # Attention calculation
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        
+        # Output
+        x = (attn @ v).transpose(1, 2).reshape(B, N_q, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+# Cross-attention Block for decoder
+class CrossBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.norm1_q = norm_layer(dim)  # for query normalization
+        self.norm1_k = norm_layer(dim)  # for key normalization
+        self.norm1_v = norm_layer(dim)  # for value normalization
+        
+        # Cross-attention
+        self.cross_attn = CrossAttention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, 
+            attn_drop=attn_drop, proj_drop=drop
+        )
+        
+        # Drop path for regularization
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
+        # MLP block (same as in regular Block)
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        
+    def forward(self, queries, keys, values):
+        # Apply cross-attention
+        x = queries + self.drop_path(
+            self.cross_attn(
+                self.norm1_q(queries),
+                self.norm1_k(keys),
+                self.norm1_v(values)
+            )
+        )
+        
+        # Apply MLP (same as in regular Block)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+# MLP module (same as in timm's vision_transformer)
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
 class MaskedAutoencoderViT(nn.Module):
-    """ Masked Autoencoder with VisionTransformer backbone
+    """ Masked Autoencoder with VisionTransformer backbone and Cross-Attention Decoder
     """
     def __init__(self, img_size=224, patch_size=16, in_chans=3,
                  embed_dim=1024, depth=24, num_heads=16,
@@ -30,7 +128,7 @@ class MaskedAutoencoderViT(nn.Module):
         super().__init__()
 
         # --------------------------------------------------------------------------
-        # MAE encoder specifics
+        # MAE encoder specifics (same as original)
         self.flow_in_chans = 1
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
         num_patches = self.patch_embed.num_patches
@@ -41,25 +139,32 @@ class MaskedAutoencoderViT(nn.Module):
         # Add flow projection layer with use_flow_proj flag
         self.use_flow_proj = use_flow_proj
         if self.use_flow_proj:
-            # Flow -> tokens projection
             self.flow_proj = nn.Linear(patch_size**2 * self.flow_in_chans, embed_dim)
 
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer) # qk_scale=None
+            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
         # --------------------------------------------------------------------------
 
         # --------------------------------------------------------------------------
-        # MAE decoder specifics
+        # MAE decoder specifics with cross-attention
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
-
+        
+        # Projection for the mask tokens (queries)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+        
+        # Projection for the encoder tokens (keys)
+        self.encoder_to_decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
+        
+        # Projection for the optical flow tokens (values)
+        self.flow_to_decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
 
         self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding
 
+        # CrossBlock for decoder
         self.decoder_blocks = nn.ModuleList([
-            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer) # qk_scale=None
+            CrossBlock(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
             for i in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
@@ -117,7 +222,7 @@ class MaskedAutoencoderViT(nn.Module):
     def flow_patchify(self, flow):
         """
         flow: (N, flow_in_chans, H, W)
-        x: (N, L, patch_size**2 *flow_in_chans)
+        x: (N, L, patch_size**2 * flow_in_chans)
         """
         p = self.patch_embed.patch_size[0]
         assert flow.shape[2] == flow.shape[3] and flow.shape[2] % p == 0
@@ -139,12 +244,12 @@ class MaskedAutoencoderViT(nn.Module):
         
         x = x.reshape(shape=(x.shape[0], h, w, p, p, 3))
         x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], 3, h * p, h * p))
+        imgs = x.reshape(shape=(x.shape[0], 3, h * p, w * p))
         return imgs
-    
+
     def flow_unpatchify(self, x):
         """
-        x: (N, L, patch_size**2 *flow_in_chans)
+        x: (N, L, patch_size**2 * flow_in_chans)
         flow: (N, flow_in_chans, H, W)
         """
         p = self.patch_embed.patch_size[0]
@@ -153,7 +258,7 @@ class MaskedAutoencoderViT(nn.Module):
         
         x = x.reshape(shape=(x.shape[0], h, w, p, p, self.flow_in_chans))
         x = torch.einsum('nhwpqc->nchpwq', x)
-        flow = x.reshape(shape=(x.shape[0], self.flow_in_chans, h * p, h * p))
+        flow = x.reshape(shape=(x.shape[0], self.flow_in_chans, h * p, w * p))
         return flow
 
     def random_masking(self, x, mask_ratio):
@@ -205,37 +310,42 @@ class MaskedAutoencoderViT(nn.Module):
 
         return x, mask, ids_restore
 
-    def forward_decoder(self, x, ids_restore):
-        # embed tokens
-        x = self.decoder_embed(x)
-
-        # append mask tokens to sequence
+    def forward_decoder(self, x, ids_restore, visible_flow_tokens):
+        # Prepare encoder tokens (keys) by projecting to decoder dimension
+        encoder_tokens = self.encoder_to_decoder_embed(x)
+        
+        # Prepare optical flow tokens (values) by projecting to decoder dimension
+        flow_tokens = self.flow_to_decoder_embed(visible_flow_tokens)
+        
+        # Create mask tokens (queries)
         mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
-        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
-        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
-        x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
-
-        # add pos embed
-        x = x + self.decoder_pos_embed
-
-        # apply Transformer blocks
+        
+        # Combine visible patches and mask tokens (like in original decoder)
+        queries = torch.cat([encoder_tokens[:, 1:, :], mask_tokens], dim=1)  # no cls token
+        queries = torch.gather(queries, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, encoder_tokens.shape[2]))  # unshuffle
+        queries = torch.cat([encoder_tokens[:, :1, :], queries], dim=1)  # append cls token
+        
+        # Add positional embedding to queries
+        queries = queries + self.decoder_pos_embed
+        
+        # Apply Cross-Attention Transformer blocks
         for blk in self.decoder_blocks:
-            x = blk(x)
-        x = self.decoder_norm(x)
-
-        # predictor projection
-        x = self.decoder_pred(x)
-
-        # remove cls token
-        x = x[:, 1:, :]
-
-        return x
+            queries = blk(queries, encoder_tokens, flow_tokens)
+        
+        # Final norm and projection
+        queries = self.decoder_norm(queries)
+        pred = self.decoder_pred(queries)
+        
+        # Remove cls token
+        pred = pred[:, 1:, :]
+        
+        return pred
 
     def forward_loss(self, targets, pred, mask):
         """
-        targets: [N, self.flow_in_chans, H, W]
-        pred: [N, L, p*p*self.flow_in_chans]
-        mask: [N, L], 0 is keep, 1 is remove, 
+        targets: [N, flow_in_chans, H, W]
+        pred: [N, L, p*p*flow_in_chans]
+        mask: [N, L], 0 is keep, 1 is remove
         """
         target = self.flow_patchify(targets)
         if self.norm_pix_loss:
@@ -252,20 +362,24 @@ class MaskedAutoencoderViT(nn.Module):
     def forward(self, imgs, targets, mask_ratio=0.75):
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
 
-        if self.use_flow_proj:
-            # Map visible flow patches to encoder dimension
-            visible_flow = self.flow_patchify(targets)  # [N, L, p*p*flow_in_chans]
-            visible_flow_proj = self.flow_proj(visible_flow)  # Project to encoder dimension
-            
-            # Apply the same masking as the encoder
-            visible_flow_masked = torch.gather(visible_flow_proj, dim=1, 
-                                            index=ids_restore[:, :latent.shape[1]-1].unsqueeze(-1).repeat(1, 1, latent.shape[-1]))
-            
-            # Sum the visible flow features with encoder output (excluding cls token)
-            latent[:, 1:, :] = latent[:, 1:, :] + visible_flow_masked
+        # Process flow patches
+        visible_flow = self.flow_patchify(targets)  # [N, L, p*p*flow_in_chans]
+        visible_flow_proj = self.flow_proj(visible_flow)  # Project to encoder dimension
         
-        pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*flow_in_chans]
+        # Apply the same masking as the encoder to get visible flow tokens
+        visible_flow_masked = torch.gather(visible_flow_proj, dim=1, 
+                                     index=ids_restore[:, :latent.shape[1]-1].unsqueeze(-1).repeat(1, 1, latent.shape[-1]))
+        
+        # Prepend a dummy token for consistency with encoder output (which has cls token)
+        dummy_token = torch.zeros_like(visible_flow_masked[:, :1, :])
+        visible_flow_tokens = torch.cat([dummy_token, visible_flow_masked], dim=1)
+        
+        # Forward through decoder with cross-attention
+        pred = self.forward_decoder(latent, ids_restore, visible_flow_tokens)
+        
+        # Calculate loss
         loss = self.forward_loss(targets, pred, mask)
+        
         return loss, pred, mask
 
 
@@ -290,7 +404,7 @@ def mae_vit_huge_patch14_dec512d8b(**kwargs):
         patch_size=14, embed_dim=1280, depth=32, num_heads=16,
         decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-    return model
+    return model 
 
 
 # set recommended archs

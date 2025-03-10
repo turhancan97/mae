@@ -19,21 +19,37 @@ class FrameDataset(Dataset):
         self.flow_dir = os.path.join(root_dir, split, 'OpticalFlow')
         self.transform = transform
         if frame_step == 1:
-            # Venice step_1 values (mean and std)
+            # Venice step_1 values (mean and std) [x, y]
             self.flow_mean = torch.tensor([-0.0025, -0.0107])
             self.flow_std = torch.tensor([2.0609, 0.5573])
+            # Venice step_1 values (mean and std) [magnitude]
+            self.flow_mag_mean = torch.tensor([1.1076])
+            self.flow_mag_std = torch.tensor([1.8252])
+
         elif frame_step == 10:
-            # Venice step_10 values (mean and std)
+            # Venice step_10 values (mean and std) [x, y]
             self.flow_mean = torch.tensor([-0.0189, -0.0450])
             self.flow_std = torch.tensor([21.0320, 5.2326])
+            # Venice step_10 values (mean and std) [magnitude]
+            self.flow_mag_mean = torch.tensor([11.9170])
+            self.flow_mag_std = torch.tensor([18.1029])
+
         elif frame_step == 30:
-            # Venice step_30 values (mean and std)
+            # Venice step_30 values (mean and std) [x, y]
             self.flow_mean = torch.tensor([-1.0678, 0.1349])
             self.flow_std = torch.tensor([49.8568, 12.3739])
+            # Venice step_30 values (mean and std) [magnitude]
+            self.flow_mag_mean = torch.tensor([32.7873])
+            self.flow_mag_std = torch.tensor([39.5597])
+
         elif frame_step == 60:
-            # Venice step_60 values (mean and std)
+            # Venice step_60 values (mean and std) [x, y]
             self.flow_mean = torch.tensor([-3.6112, 0.1128])
             self.flow_std = torch.tensor([73.9313, 19.0465])
+            # Venice step_60 values (mean and std) [magnitude]
+            self.flow_mag_mean = torch.tensor([54.1642])
+            self.flow_mag_std = torch.tensor([53.9249])
+            
         else:
             raise ValueError(f"Invalid frame step: {frame_step}")
         # Get all frame pairs (assuming they're numbered sequentially)
@@ -64,12 +80,19 @@ class FrameDataset(Dataset):
             to_tensor = transforms.ToTensor()
             frame = to_tensor(frame)
         
-        # Load and normalize optical flow
+        # Load optical flow
         flow = torch.from_numpy(np.load(flow_path))
-        flow = (flow - self.flow_mean.view(2, 1, 1)) / self.flow_std.view(2, 1, 1)
-        
-        # Calculate magnitude of flow vectors
-        # torch.norm calculates the L2 norm along dimension 0 (channel dimension)
-        flow = torch.norm(flow, p=2, dim=0, keepdim=True)  # Shape: (1, 224, 224)
+
+        if True:
+            # calculate magnitude of flow vectors
+            flow = torch.norm(flow, p=2, dim=0, keepdim=True)  # Shape: (1, 224, 224)
+            # normalize magnitude with mean and std
+            flow = (flow - self.flow_mag_mean.view(1, 1, 1)) / self.flow_mag_std.view(1, 1, 1)
+        else:
+            # normalize optical flow
+            flow = (flow - self.flow_mean.view(2, 1, 1)) / self.flow_std.view(2, 1, 1) 
+            # Calculate magnitude of flow vectors
+            # torch.norm calculates the L2 norm along dimension 0 (channel dimension)
+            flow = torch.norm(flow, p=2, dim=0, keepdim=True)  # Shape: (1, 224, 224)
         
         return frame, flow

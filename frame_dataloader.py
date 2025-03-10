@@ -6,7 +6,7 @@ from PIL import Image
 import numpy as np
 
 class FrameDataset(Dataset):
-    """Dataset for loading frame pairs and their optical flow"""
+    """Dataset for loading frame pairs and their corresponding optical flow"""
     
     def __init__(self, root_dir, split='train', transform=None, frame_step=1):
         """

@@ -25,24 +25,16 @@ class MaskedAutoencoderViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3,
                  embed_dim=1024, depth=24, num_heads=16,
                  decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
-                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False,
-                 use_flow_proj=True):
+                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False):
         super().__init__()
 
         # --------------------------------------------------------------------------
         # MAE encoder specifics
-        self.flow_in_chans = 1
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)  # fixed sin-cos embedding
-
-        # Add flow projection layer with use_flow_proj flag
-        self.use_flow_proj = use_flow_proj
-        if self.use_flow_proj:
-            # Flow -> tokens projection
-            self.flow_proj = nn.Linear(patch_size**2 * self.flow_in_chans, embed_dim)
 
         self.blocks = nn.ModuleList([
             Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer) # qk_scale=None
@@ -63,7 +55,7 @@ class MaskedAutoencoderViT(nn.Module):
             for i in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
-        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * self.flow_in_chans, bias=True) # decoder to patch
+        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans, bias=True) # decoder to patch
         # --------------------------------------------------------------------------
 
         self.norm_pix_loss = norm_pix_loss
@@ -114,20 +106,6 @@ class MaskedAutoencoderViT(nn.Module):
         x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * 3))
         return x
 
-    def flow_patchify(self, flow):
-        """
-        flow: (N, flow_in_chans, H, W)
-        x: (N, L, patch_size**2 *flow_in_chans)
-        """
-        p = self.patch_embed.patch_size[0]
-        assert flow.shape[2] == flow.shape[3] and flow.shape[2] % p == 0
-
-        h = w = flow.shape[2] // p
-        x = flow.reshape(shape=(flow.shape[0], self.flow_in_chans, h, p, w, p))
-        x = torch.einsum('nchpwq->nhwpqc', x)
-        x = x.reshape(shape=(flow.shape[0], h * w, p**2 * self.flow_in_chans))
-        return x
-
     def unpatchify(self, x):
         """
         x: (N, L, patch_size**2 *3)
@@ -141,20 +119,6 @@ class MaskedAutoencoderViT(nn.Module):
         x = torch.einsum('nhwpqc->nchpwq', x)
         imgs = x.reshape(shape=(x.shape[0], 3, h * p, h * p))
         return imgs
-    
-    def flow_unpatchify(self, x):
-        """
-        x: (N, L, patch_size**2 *flow_in_chans)
-        flow: (N, flow_in_chans, H, W)
-        """
-        p = self.patch_embed.patch_size[0]
-        h = w = int(x.shape[1]**.5)
-        assert h * w == x.shape[1]
-        
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, self.flow_in_chans))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        flow = x.reshape(shape=(x.shape[0], self.flow_in_chans, h * p, h * p))
-        return flow
 
     def random_masking(self, x, mask_ratio):
         """
@@ -205,18 +169,22 @@ class MaskedAutoencoderViT(nn.Module):
 
         return x, mask, ids_restore
 
-    def forward_decoder(self, x, ids_restore):
+    def forward_decoder(self, x_1, x_2, ids_restore):
         # embed tokens
-        x = self.decoder_embed(x)
+        x_1 = self.decoder_embed(x_1)
+        x_1 = x_1 + self.decoder_pos_embed
 
+        x_2 = self.decoder_embed(x_2)
         # append mask tokens to sequence
-        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
-        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
-        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
-        x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
+        mask_tokens = self.mask_token.repeat(x_2.shape[0], ids_restore.shape[1] + 1 - x_2.shape[1], 1)
+        x_2_ = torch.cat([x_2[:, 1:, :], mask_tokens], dim=1)  # no cls token
+        x_2_ = torch.gather(x_2_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_2.shape[2]))  # unshuffle
+        x_2 = torch.cat([x_2[:, :1, :], x_2_], dim=1)  # append cls token
 
         # add pos embed
-        x = x + self.decoder_pos_embed
+        x_2 = x_2 + self.decoder_pos_embed
+
+        x = torch.cat([x_1, x_2], dim=1)
 
         # apply Transformer blocks
         for blk in self.decoder_blocks:
@@ -226,18 +194,18 @@ class MaskedAutoencoderViT(nn.Module):
         # predictor projection
         x = self.decoder_pred(x)
 
-        # remove cls token
-        x = x[:, 1:, :]
+        # remove x_1 and cls token of x_2
+        x = x[:, x_1.shape[1] + 1:, :]
 
         return x
 
-    def forward_loss(self, targets, pred, mask):
+    def forward_loss(self, imgs, pred, mask):
         """
-        targets: [N, self.flow_in_chans, H, W]
-        pred: [N, L, p*p*self.flow_in_chans]
+        imgs: [N, 3, H, W]
+        pred: [N, L, p*p*3]
         mask: [N, L], 0 is keep, 1 is remove, 
         """
-        target = self.flow_patchify(targets)
+        target = self.patchify(imgs)
         if self.norm_pix_loss:
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
@@ -249,24 +217,13 @@ class MaskedAutoencoderViT(nn.Module):
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss
 
-    def forward(self, imgs, targets, mask_ratio=0.75):
-        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
+    def forward(self, img_1, img_2, mask_ratio=0.75):
+        latent_1, _, _ = self.forward_encoder(img_1, mask_ratio=0)
+        latent_2, mask_2, ids_restore = self.forward_encoder(img_2, mask_ratio)
 
-        if self.use_flow_proj:
-            # Map visible flow patches to encoder dimension
-            visible_flow = self.flow_patchify(targets)  # [N, L, p*p*flow_in_chans]
-            visible_flow_proj = self.flow_proj(visible_flow)  # Project to encoder dimension
-            
-            # Apply the same masking as the encoder
-            visible_flow_masked = torch.gather(visible_flow_proj, dim=1, 
-                                            index=ids_restore[:, :latent.shape[1]-1].unsqueeze(-1).repeat(1, 1, latent.shape[-1]))
-            
-            # Sum the visible flow features with encoder output (excluding cls token)
-            latent[:, 1:, :] = latent[:, 1:, :] + visible_flow_masked
-        
-        pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*flow_in_chans]
-        loss = self.forward_loss(targets, pred, mask)
-        return loss, pred, mask
+        pred = self.forward_decoder(latent_1, latent_2, ids_restore)  # [N, L, p*p*3]
+        loss = self.forward_loss(img_2, pred, mask_2)
+        return loss, pred, mask_2
 
 
 def mae_vit_base_patch16_dec512d8b(**kwargs):

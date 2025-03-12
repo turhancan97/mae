@@ -42,9 +42,9 @@ from frame_dataloader import FrameDataset
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
-    parser.add_argument('--batch_size', default=128, type=int,
+    parser.add_argument('--batch_size', default=64, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=25, type=int)
+    parser.add_argument('--epochs', default=100, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
@@ -55,16 +55,12 @@ def get_args_parser():
     parser.add_argument('--input_size', default=224, type=int,
                         help='images input size')
 
-    parser.add_argument('--mask_ratio', default=0.75, type=float,
+    parser.add_argument('--mask_ratio', default=0.90, type=float,
                         help='Masking ratio (percentage of removed patches).')
 
     parser.add_argument('--norm_pix_loss', action='store_true',
                         help='Use (per-patch) normalized pixels as targets for computing loss')
     parser.set_defaults(norm_pix_loss=False)
-
-    parser.add_argument('--use_flow_proj', action='store_true',
-                        help='Use flow projection')
-    parser.set_defaults(use_flow_proj=True)
 
     # Optimizer parameters
     parser.add_argument('--weight_decay', type=float, default=0.05,
@@ -72,12 +68,12 @@ def get_args_parser():
 
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='learning rate (absolute lr)')
-    parser.add_argument('--blr', type=float, default=1e-5, metavar='LR',
+    parser.add_argument('--blr', type=float, default=1.5e-4, metavar='LR',
                         help='base learning rate: absolute_lr = base_lr * total_batch_size / 256')
     parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0')
 
-    parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N',
+    parser.add_argument('--warmup_epochs', type=int, default=10, metavar='N',
                         help='epochs to warmup LR')
 
     # Dataset parameters
@@ -92,8 +88,10 @@ def get_args_parser():
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--resume', default='/home/kargin/Projects/repositories/mae/model/maskfeat_vit-base-p16_8xb256-amp-coslr-300e_in1k_20221101-6dfc8bf3.pth',
+    parser.add_argument('--resume', default='',
                         help='resume from checkpoint')
+    # parser.add_argument('--resume', default='/home/kargin/Projects/repositories/mae/model/maskfeat_vit-base-p16_8xb256-amp-coslr-300e_in1k_20221101-6dfc8bf3.pth',
+    #                     help='resume from checkpoint')
     # parser.add_argument('--resume', default='/home/kargin/Projects/repositories/mae/model/in1k_VIT_B_MaskFeat_PT_epoch_01600.pyth',
     #                     help='resume from checkpoint')
 
@@ -145,7 +143,7 @@ def main(args):
     # simple augmentation
     transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.228, 0.224, 0.225])])
     # dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
     frame_step = args.data_path.split('/')[-1]
     step = int(frame_step.split('step_')[1])
@@ -171,10 +169,6 @@ def main(args):
 
     if global_rank == 0 and args.log_wandb and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
-        if args.use_flow_proj:
-            proj_name = "w_flow_projection"
-        else:
-            proj_name = "wo_flow_projection"
         if args.resume:
             train_type = "FT"
         else:
@@ -183,7 +177,7 @@ def main(args):
             dataset_type = "25percent"
         else:
             dataset_type = "full"
-        args.wandb_run_name = f"{args.wandb_run_name}_Frame_{frame_step}_{proj_name}_{train_type}_{dataset_type}"
+        args.wandb_run_name = f"{args.wandb_run_name}_Frame_{frame_step}_SiamMAE_{train_type}_{dataset_type}"
         print(f"Wandb run name: {args.wandb_run_name}")
         log_writer = WandbLogger(args)
     else:
@@ -198,7 +192,7 @@ def main(args):
     )
     
     print("Using Self-Attention Decoder MAE model")
-    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss, use_flow_proj=args.use_flow_proj)
+    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
 
     model.to(device)
 

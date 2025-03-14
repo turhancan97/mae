@@ -37,17 +37,18 @@ def train_one_epoch(model: torch.nn.Module,
     # if log_writer is not None:
     #     print('log_dir: {}'.format(log_writer.log_dir))
 
-    for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (samples_1, samples_2, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
-        samples = samples.to(device, non_blocking=True)
+        samples_1 = samples_1.to(device, non_blocking=True)
+        samples_2 = samples_2.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
         with torch.cuda.amp.autocast():
-            loss, pred, mask = model(samples, targets, mask_ratio=args.mask_ratio)
+            loss, pred, mask = model(samples_1, samples_2, targets, mask_ratio=args.mask_ratio)
 
         loss_value = loss.item()
 
@@ -89,8 +90,10 @@ def train_one_epoch(model: torch.nn.Module,
     # log the last batch
     if log_writer is not None and args.log_wandb and misc.is_main_process() and epoch % 5 == 0:
         # log_writer.log_image(samples, 'samples')
-        samples = samples[0:8]
-        samples = samples.detach().cpu()
+        samples_1 = samples_1[0:8]
+        samples_2 = samples_2[0:8]
+        samples_1 = samples_1.detach().cpu()
+        samples_2 = samples_2.detach().cpu()
 
         targets = targets[0:8]
         targets = targets.detach().cpu()
@@ -108,7 +111,7 @@ def train_one_epoch(model: torch.nn.Module,
         mask_output = model.module.flow_unpatchify(mask_output)  # 1 is removing, 0 is keeping
         mask_output = mask_output.detach().cpu()
 
-        im_masked = samples * (1 - mask_input)
+        im_masked = samples_2 * (1 - mask_input)
         target_paste = targets * (1 - mask_output) + pred * mask_output
 
         # concat dummy channel to match the shape of the target
@@ -118,10 +121,11 @@ def train_one_epoch(model: torch.nn.Module,
         target_paste = flow_to_image(target_paste)
         target = flow_to_image(targets)
 
-        log_writer.log_image(samples, f"original input")
-        log_writer.log_image(target, f"original target")
-        log_writer.log_image(im_masked, f"masked input")
-        log_writer.log_image(target_paste, f"reconstructed output")
+        log_writer.log_image(samples_1, f"original input Past Frame")
+        log_writer.log_image(samples_2, f"original input Future Frame")
+        log_writer.log_image(target, f"original target Optical Flow")
+        log_writer.log_image(im_masked, f"masked input Future Frame")
+        log_writer.log_image(target_paste, f"reconstructed output Optical Flow")
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

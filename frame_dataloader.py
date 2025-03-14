@@ -66,19 +66,23 @@ class FrameDataset(Dataset):
         frame_num = self.frame_pairs[idx]
         
         # Load frame pair
-        frame_path = os.path.join(self.image_dir, f'Venice_frame_{frame_num:06d}_1.jpg')
+        frame_1_path = os.path.join(self.image_dir, f'Venice_frame_{frame_num:06d}_1.jpg')
+        frame_2_path = os.path.join(self.image_dir, f'Venice_frame_{frame_num:06d}_2.jpg')
         flow_path = os.path.join(self.flow_dir, f'Venice_flow_{frame_num:06d}.npy')
         
         # Read images
-        frame = Image.open(frame_path).convert('RGB')
+        frame_1 = Image.open(frame_1_path).convert('RGB')
+        frame_2 = Image.open(frame_2_path).convert('RGB')
         
         # Apply transforms if specified
         if self.transform is not None:
-            frame = self.transform(frame)    
+            frame_1 = self.transform(frame_1)    
+            frame_2 = self.transform(frame_2)
         else:
             # Convert to tensor if no transform specified
             to_tensor = transforms.ToTensor()
-            frame = to_tensor(frame)
+            frame_1 = to_tensor(frame_1)
+            frame_2 = to_tensor(frame_2)
         
         # Load optical flow
         flow = torch.from_numpy(np.load(flow_path))
@@ -95,4 +99,4 @@ class FrameDataset(Dataset):
             # torch.norm calculates the L2 norm along dimension 0 (channel dimension)
             flow = torch.norm(flow, p=2, dim=0, keepdim=True)  # Shape: (1, 224, 224)
         
-        return frame, flow
+        return frame_1, frame_2, flow

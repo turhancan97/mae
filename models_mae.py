@@ -31,7 +31,7 @@ class MaskedAutoencoderViT(nn.Module):
 
         # --------------------------------------------------------------------------
         # MAE encoder specifics
-        self.flow_in_chans = 1
+        self.flow_in_chans = 2
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
         num_patches = self.patch_embed.num_patches
 
@@ -205,18 +205,22 @@ class MaskedAutoencoderViT(nn.Module):
 
         return x, mask, ids_restore
 
-    def forward_decoder(self, x, ids_restore):
+    def forward_decoder(self, x_1, x_2, ids_restore):
         # embed tokens
-        x = self.decoder_embed(x)
+        x_1 = self.decoder_embed(x_1)
+        x_1 = x_1 + self.decoder_pos_embed
 
+        x_2 = self.decoder_embed(x_2)
         # append mask tokens to sequence
-        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
-        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
-        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
-        x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
+        mask_tokens = self.mask_token.repeat(x_2.shape[0], ids_restore.shape[1] + 1 - x_2.shape[1], 1)
+        x_2_ = torch.cat([x_2[:, 1:, :], mask_tokens], dim=1)  # no cls token
+        x_2_ = torch.gather(x_2_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_2.shape[2]))  # unshuffle
+        x_2 = torch.cat([x_2[:, :1, :], x_2_], dim=1)  # append cls token
 
         # add pos embed
-        x = x + self.decoder_pos_embed
+        x_2 = x_2 + self.decoder_pos_embed
+
+        x = torch.cat([x_1, x_2], dim=1)
 
         # apply Transformer blocks
         for blk in self.decoder_blocks:
@@ -226,8 +230,8 @@ class MaskedAutoencoderViT(nn.Module):
         # predictor projection
         x = self.decoder_pred(x)
 
-        # remove cls token
-        x = x[:, 1:, :]
+        # remove x_1 and cls token of x_2
+        x = x[:, x_1.shape[1] + 1:, :]
 
         return x
 
@@ -249,8 +253,9 @@ class MaskedAutoencoderViT(nn.Module):
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss
 
-    def forward(self, imgs, targets, mask_ratio=0.75):
-        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
+    def forward(self, imgs_1, imgs_2, targets, mask_ratio=0.75):
+        latent_1, _, _ = self.forward_encoder(imgs_1, mask_ratio=0)
+        latent_2, mask, ids_restore = self.forward_encoder(imgs_2, mask_ratio)
 
         if self.use_flow_proj:
             # Map visible flow patches to encoder dimension
@@ -259,12 +264,12 @@ class MaskedAutoencoderViT(nn.Module):
             
             # Apply the same masking as the encoder
             visible_flow_masked = torch.gather(visible_flow_proj, dim=1, 
-                                            index=ids_restore[:, :latent.shape[1]-1].unsqueeze(-1).repeat(1, 1, latent.shape[-1]))
+                                            index=ids_restore[:, :latent_2.shape[1]-1].unsqueeze(-1).repeat(1, 1, latent_2.shape[-1]))
             
             # Sum the visible flow features with encoder output (excluding cls token)
-            latent[:, 1:, :] = latent[:, 1:, :] + visible_flow_masked
+            latent_2[:, 1:, :] = latent_2[:, 1:, :] + visible_flow_masked
         
-        pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*flow_in_chans]
+        pred = self.forward_decoder(latent_1, latent_2, ids_restore)  # [N, L, p*p*flow_in_chans]
         loss = self.forward_loss(targets, pred, mask)
         return loss, pred, mask
 

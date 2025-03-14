@@ -92,8 +92,10 @@ def get_args_parser():
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--resume', default='/home/kargin/Projects/repositories/mae/model/maskfeat_vit-base-p16_8xb256-amp-coslr-300e_in1k_20221101-6dfc8bf3.pth',
+    parser.add_argument('--resume', default='',
                         help='resume from checkpoint')
+    # parser.add_argument('--resume', default='/home/kargin/Projects/repositories/mae/model/maskfeat_vit-base-p16_8xb256-amp-coslr-300e_in1k_20221101-6dfc8bf3.pth',
+    #                     help='resume from checkpoint')
     # parser.add_argument('--resume', default='/home/kargin/Projects/repositories/mae/model/in1k_VIT_B_MaskFeat_PT_epoch_01600.pyth',
     #                     help='resume from checkpoint')
 
@@ -145,7 +147,7 @@ def main(args):
     # simple augmentation
     transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
     # dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
     frame_step = args.data_path.split('/')[-1]
     step = int(frame_step.split('step_')[1])
@@ -156,8 +158,9 @@ def main(args):
     # dataset_val = FrameDataset(args.data_path, 'val', transform, step)
     # dataset_test = FrameDataset(args.data_path, 'test', transform, step)
     print(f"Dataset train length: {len(dataset_train)}")
-    print(f"Frame shape: {dataset_train[0][0].shape}")
-    print(f"Flow shape: {dataset_train[0][1].shape}")
+    print(f"Frame_1 shape: {dataset_train[0][0].shape}")
+    print(f"Frame_2 shape: {dataset_train[0][1].shape}")
+    print(f"Flow shape: {dataset_train[0][2].shape}")
 
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
